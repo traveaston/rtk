@@ -1,6 +1,7 @@
 //! Reads user settings from config.toml.
 
 use super::constants::{CONFIG_TOML, DEFAULT_HISTORY_DAYS, RTK_DATA_DIR};
+use super::damping::{Damper, DEFAULT_DAMPING_CEILING};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -149,6 +150,22 @@ pub struct TrackingConfig {
     pub history_days: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_path: Option<PathBuf>,
+    /// Input-token ceiling above which savings analytics damp the raw count.
+    ///
+    /// View-only: the `commands` table keeps raw `input_tokens` forever, and
+    /// damping is applied during aggregation. `0` disables it, restoring the
+    /// exact raw numbers. See [`crate::core::damping`] for the curve and why
+    /// the default tracks Claude Code's terminal-output truncation limit.
+    ///
+    /// Defaulted by function rather than by `Default` so that an existing
+    /// config.toml written before this field existed still parses, and picks up
+    /// the ceiling rather than silently damping nothing.
+    #[serde(default = "default_damping_ceiling")]
+    pub damping_ceiling: usize,
+}
+
+fn default_damping_ceiling() -> usize {
+    DEFAULT_DAMPING_CEILING
 }
 
 impl Default for TrackingConfig {
@@ -157,7 +174,15 @@ impl Default for TrackingConfig {
             enabled: true,
             history_days: DEFAULT_HISTORY_DAYS as u32,
             database_path: None,
+            damping_ceiling: default_damping_ceiling(),
         }
+    }
+}
+
+impl TrackingConfig {
+    /// Build the damper the analytics readers apply to raw input-token counts.
+    pub fn to_damper(&self) -> Damper {
+        Damper::new(self.damping_ceiling)
     }
 }
 
@@ -481,6 +506,64 @@ pub fn show_config() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_damping_ceiling_defaults_when_missing() {
+        // Empty config, and a [tracking] section written before the field
+        // existed, must both land on the real ceiling — not 0, which would
+        // silently disable damping for every pre-existing install.
+        let config: Config = toml::from_str("").expect("valid toml");
+        assert_eq!(config.tracking.damping_ceiling, DEFAULT_DAMPING_CEILING);
+
+        let legacy = r#"
+[tracking]
+enabled = true
+history_days = 90
+"#;
+        let config: Config = toml::from_str(legacy).expect("valid toml");
+        assert_eq!(config.tracking.damping_ceiling, DEFAULT_DAMPING_CEILING);
+    }
+
+    #[test]
+    fn test_damping_ceiling_custom_value() {
+        let toml = r#"
+[tracking]
+enabled = true
+history_days = 90
+damping_ceiling = 25000
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(config.tracking.damping_ceiling, 25_000);
+        assert_eq!(config.tracking.to_damper(), Damper::new(25_000));
+    }
+
+    #[test]
+    fn test_damping_ceiling_zero_disables() {
+        let toml = r#"
+[tracking]
+enabled = true
+history_days = 90
+damping_ceiling = 0
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert_eq!(config.tracking.damping_ceiling, 0);
+        assert_eq!(config.tracking.to_damper(), Damper::disabled());
+        assert_eq!(
+            config.tracking.to_damper().damp_tokens(26_000_000),
+            26_000_000
+        );
+    }
+
+    #[test]
+    fn test_damping_ceiling_round_trips_through_default_config() {
+        let serialized = toml::to_string_pretty(&Config::default()).expect("serializable");
+        assert!(
+            serialized.contains("damping_ceiling = 12500"),
+            "rtk config must surface the damping ceiling, got:\n{serialized}"
+        );
+        let parsed: Config = toml::from_str(&serialized).expect("round trip");
+        assert_eq!(parsed.tracking.damping_ceiling, DEFAULT_DAMPING_CEILING);
+    }
 
     #[test]
     fn test_hooks_config_deserialize() {

@@ -63,6 +63,7 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
 }
 
 use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
+use super::damping::Damper;
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -91,6 +92,12 @@ use super::constants::{DEFAULT_HISTORY_DAYS, HISTORY_DB, RTK_DATA_DIR};
 /// ```
 pub struct Tracker {
     conn: Connection,
+    /// Applied to raw `input_tokens` during aggregation, never on write.
+    ///
+    /// Held on the tracker rather than threaded through each query so every
+    /// reader damps identically and no new reader can forget to. The rows stay
+    /// raw: see [`crate::core::damping`].
+    damper: Damper,
 }
 
 /// Individual command record from tracking history.
@@ -307,6 +314,107 @@ pub struct MonthStats {
 /// unsigned, is clamped to 0.
 type CommandStats = (String, usize, usize, f64, u64);
 
+/// Running totals for one aggregation bucket — a day, a week, a month, a single
+/// command, or the whole history.
+///
+/// Every bucketed savings reader folds through this, so the damping rule lives in
+/// one place and a new reader cannot forget to apply it. (`get_recent_filtered`
+/// reports single rows, so it damps through [`Damper`] directly.) Note
+/// `input_tokens` holds the **damped** sum: the stored `saved_tokens` /
+/// `savings_pct` columns are raw by design and are deliberately not read here.
+#[derive(Debug, Default, Clone, Copy)]
+struct PeriodAccumulator {
+    commands: usize,
+    input_tokens: usize,
+    output_tokens: usize,
+    exec_time_ms: u64,
+}
+
+impl PeriodAccumulator {
+    /// Fold one raw row in, damping its input on the way.
+    ///
+    /// Damping is per row, not per bucket: each command's output was truncated
+    /// individually, so summing raw inputs first would smear one runaway command's
+    /// ceiling allowance across every other command in the bucket.
+    fn add(
+        &mut self,
+        damper: &Damper,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+    ) {
+        self.commands += 1;
+        self.input_tokens += damper.damp_tokens(input_tokens);
+        self.output_tokens += output_tokens;
+        self.exec_time_ms += exec_time_ms;
+    }
+
+    /// Tokens saved across the bucket, keeping the sign.
+    ///
+    /// Negative when the bucket's filters emitted more than the wrapped commands
+    /// did — a real regression the rate must be able to show.
+    fn saved_signed(&self) -> i64 {
+        self.input_tokens as i64 - self.output_tokens as i64
+    }
+
+    /// Tokens saved, clamped at 0 for the unsigned public fields.
+    fn saved_clamped(&self) -> usize {
+        self.saved_signed().max(0) as usize
+    }
+
+    /// Weighted savings rate: `saved / damped input`.
+    ///
+    /// Weighted, never a mean of per-row rates — that would under-weight
+    /// high-volume commands. Keeps the sign, so a regressing bucket reads
+    /// negative instead of a fake 0%.
+    fn savings_pct(&self) -> f64 {
+        if self.input_tokens == 0 {
+            return 0.0;
+        }
+        (self.saved_signed() as f64 / self.input_tokens as f64) * 100.0
+    }
+
+    fn avg_time_ms(&self) -> u64 {
+        if self.commands == 0 {
+            0
+        } else {
+            self.exec_time_ms / self.commands as u64
+        }
+    }
+}
+
+/// A bucket's identity as a pair of SQL expressions over `commands`.
+///
+/// `key` names the group and is what buckets sort by; `label` carries a second
+/// value along for groups that report a range (weeks report both ends) and is
+/// `"''"` otherwise. Both are literal fragments from this module — they are
+/// interpolated into SQL, so they must never carry caller input.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    key: &'static str,
+    label: &'static str,
+}
+
+impl Bucket {
+    /// A bucket whose group needs no secondary label.
+    const fn simple(key: &'static str) -> Self {
+        Self { key, label: "''" }
+    }
+}
+
+/// One calendar day, `YYYY-MM-DD`.
+const DAY_BUCKET: Bucket = Bucket::simple("DATE(timestamp)");
+
+/// One week, keyed by its start date and labelled with its end date.
+/// Weeks end on Sunday (SQLite's `weekday 0`), matching the pre-damping reader.
+const WEEK_BUCKET: Bucket = Bucket {
+    key: "DATE(timestamp, 'weekday 0', '-6 days')",
+    label: "DATE(timestamp, 'weekday 0')",
+};
+
+/// One calendar month, `YYYY-MM`.
+const MONTH_BUCKET: Bucket = Bucket::simple("strftime('%Y-%m', timestamp)");
+
 /// Current tracking-DB schema version, stored in the SQLite `user_version` pragma.
 ///
 /// `Tracker::new()` is on the hot path (every `rtk <cmd>` invocation and every
@@ -479,7 +587,21 @@ impl Tracker {
     pub fn new() -> Result<Self> {
         Ok(Self {
             conn: open_and_prepare(MigrationMode::GatedByVersion)?,
+            // `cached_config()` rather than a fresh `Config::load()`: this is the
+            // same hot path (`open_and_prepare` -> `get_db_path`) that already
+            // reads config, so this costs no extra disk round trip.
+            damper: crate::core::config::cached_config().tracking.to_damper(),
         })
+    }
+
+    /// Override the damper this tracker aggregates with.
+    ///
+    /// The seam that lets a caller read the same rows at a different ceiling —
+    /// today only tests use it, since damping is otherwise config-driven.
+    #[allow(dead_code)]
+    pub fn with_damper(mut self, damper: Damper) -> Self {
+        self.damper = damper;
+        self
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -487,11 +609,21 @@ impl Tracker {
     /// Runs the same `run_schema_migrations` the real on-disk `Tracker::new()`
     /// path uses, rather than hand-duplicating the DDL — a second copy would
     /// silently drift from the real schema the next time `SCHEMA_VERSION` bumps.
+    ///
+    /// Damping is **off** here: a test that writes 1000 in / 200 out wants to
+    /// assert on 800, not on a config-dependent damped figure. Tests that mean
+    /// to exercise damping ask for it via [`Self::new_in_memory_with_damper`].
     #[cfg(test)]
     pub fn new_in_memory() -> Result<Self> {
+        Self::new_in_memory_with_damper(Damper::disabled())
+    }
+
+    /// Create an isolated in-memory tracker that aggregates through `damper`.
+    #[cfg(test)]
+    pub fn new_in_memory_with_damper(damper: Damper) -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
         run_schema_migrations(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, damper })
     }
 
     /// Record a command execution with token counts and timing.
@@ -835,14 +967,12 @@ impl Tracker {
     /// or any subdirectory (prefix match with path separator).
     pub fn get_summary_filtered(&self, project_path: Option<&str>) -> Result<GainSummary> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut total_commands = 0usize;
-        let mut total_input = 0usize;
-        let mut total_output = 0usize;
-        let mut total_saved = 0usize;
-        let mut total_time_ms = 0u64;
+        let mut totals = PeriodAccumulator::default();
 
+        // Raw `input_tokens`/`output_tokens`, not the stored `saved_tokens` column:
+        // savings are recomputed from the damped input at read time. // changed: damping
         let mut stmt = self.conn.prepare(
-            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms
+            "SELECT input_tokens, output_tokens, exec_time_ms
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)", // added: project filter
         )?;
@@ -852,107 +982,123 @@ impl Tracker {
             Ok((
                 row.get::<_, i64>(0)? as usize,
                 row.get::<_, i64>(1)? as usize,
-                // saved_tokens may be negative (a command that worsened output); clamp
-                // to 0 for the unsigned aggregate so it never wraps to a huge usize.
-                row.get::<_, i64>(2)?.max(0) as usize,
-                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(2)? as u64,
             ))
         })?;
 
         for row in rows {
-            let (input, output, saved, time_ms) = row?;
-            total_commands += 1;
-            total_input += input;
-            total_output += output;
-            total_saved += saved;
-            total_time_ms += time_ms;
+            let (input, output, time_ms) = row?;
+            totals.add(&self.damper, input, output, time_ms);
         }
-
-        let avg_savings_pct = if total_input > 0 {
-            (total_saved as f64 / total_input as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let avg_time_ms = if total_commands > 0 {
-            total_time_ms / total_commands as u64
-        } else {
-            0
-        };
 
         let by_command = self.get_by_command(project_path)?; // added: pass project filter
         let by_day = self.get_by_day(project_path)?; // added: pass project filter
 
         Ok(GainSummary {
-            total_commands,
-            total_input,
-            total_output,
-            total_saved,
-            avg_savings_pct,
-            total_time_ms,
-            avg_time_ms,
+            total_commands: totals.commands,
+            total_input: totals.input_tokens,
+            total_output: totals.output_tokens,
+            total_saved: totals.saved_clamped(),
+            avg_savings_pct: totals.savings_pct(),
+            total_time_ms: totals.exec_time_ms,
+            avg_time_ms: totals.avg_time_ms(),
             by_command,
             by_day,
         })
+    }
+
+    /// Stream raw rows for the project scope and fold them into one accumulator
+    /// per `bucket`, damping each row's input as it lands.
+    ///
+    /// The single place that turns rows into buckets, so all six bucketed readers
+    /// share one damping and one weighting rule. Grouping happens in Rust rather
+    /// than SQL because damping is a per-row transform SQL can't express.
+    fn accumulate_by(
+        &self,
+        bucket: Bucket,
+        project_path: Option<&str>,
+    ) -> Result<HashMap<(String, String), PeriodAccumulator>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        // `bucket.key`/`bucket.label` are `&'static str` literals from this module,
+        // never caller input — the project scope is still bound as parameters.
+        let sql = format!(
+            "SELECT {}, {}, input_tokens, output_tokens, exec_time_ms
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)",
+            bucket.key, bucket.label
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as u64,
+            ))
+        })?;
+
+        let mut buckets: HashMap<(String, String), PeriodAccumulator> = HashMap::new();
+        for row in rows {
+            let (key, label, input, output, time_ms) = row?;
+            buckets
+                .entry((key, label))
+                .or_default()
+                .add(&self.damper, input, output, time_ms);
+        }
+        Ok(buckets)
     }
 
     fn get_by_command(
         &self,
         project_path: Option<&str>, // added
     ) -> Result<Vec<CommandStats>> {
-        let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, COUNT(*), SUM(saved_tokens),
-                    CASE WHEN SUM(input_tokens) > 0 THEN SUM(saved_tokens) * 100.0 / SUM(input_tokens) ELSE 0.0 END,
-                    AVG(exec_time_ms)
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY rtk_cmd
-             ORDER BY SUM(saved_tokens) DESC
-             LIMIT 10", // added: project filter in WHERE
-        )?;
+        let buckets = self.accumulate_by(Bucket::simple("rtk_cmd"), project_path)?;
 
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as usize,
-                // SUM(saved_tokens): clamp a net-negative group to 0 (unsigned field).
-                row.get::<_, i64>(2)?.max(0) as usize,
-                row.get::<_, f64>(3)?,
-                row.get::<_, f64>(4)? as u64,
-            ))
-        })?;
+        // Rank on the SIGNED saving, as the old `ORDER BY SUM(saved_tokens) DESC`
+        // did, so a regressing command sorts below a break-even one instead of
+        // tying at the clamped 0 the public tuple carries. Command name breaks
+        // ties so the table is stable run to run — a HashMap's order is not.
+        let mut ranked: Vec<(i64, CommandStats)> = buckets
+            .into_iter()
+            .map(|((rtk_cmd, _), acc)| {
+                (
+                    acc.saved_signed(),
+                    (
+                        rtk_cmd,
+                        acc.commands,
+                        acc.saved_clamped(),
+                        acc.savings_pct(),
+                        acc.avg_time_ms(),
+                    ),
+                )
+            })
+            .collect();
 
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        ranked
+            .sort_by(|(a_saved, a), (b_saved, b)| b_saved.cmp(a_saved).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(10);
+        Ok(ranked.into_iter().map(|(_, stats)| stats).collect())
     }
 
     fn get_by_day(
         &self,
         project_path: Option<&str>, // added
     ) -> Result<Vec<(String, usize)>> {
-        let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT DATE(timestamp), SUM(saved_tokens)
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY DATE(timestamp)
-             ORDER BY DATE(timestamp) DESC
-             LIMIT 30", // added: project filter in WHERE
-        )?;
+        let mut days: Vec<(String, usize)> = self
+            .accumulate_by(DAY_BUCKET, project_path)?
+            .into_iter()
+            // Clamp a net-negative day to 0 for the unsigned field.
+            .map(|((date, _), acc)| (date, acc.saved_clamped()))
+            .collect();
 
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
-            // SUM(saved_tokens) per day: clamp a net-negative day to 0 (unsigned field).
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?.max(0) as usize,
-            ))
-        })?;
-
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        result.reverse();
-        Ok(result)
+        // ISO dates sort lexicographically, so this is chronological order.
+        // Newest 30 first, then flip back to oldest-first for the caller.
+        days.sort_by(|a, b| b.0.cmp(&a.0));
+        days.truncate(30);
+        days.reverse();
+        Ok(days)
     }
 
     /// Get daily statistics for all recorded days.
@@ -979,53 +1125,24 @@ impl Tracker {
 
     /// Get daily statistics filtered by project path. // added
     pub fn get_all_days_filtered(&self, project_path: Option<&str>) -> Result<Vec<DayStats>> {
-        let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                DATE(timestamp) as date,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY DATE(timestamp)
-             ORDER BY DATE(timestamp) DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
-            let input = row.get::<_, i64>(2)? as usize;
-            let saved = row.get::<_, i64>(4)?.max(0) as usize; // clamp net-negative group
-            let commands = row.get::<_, i64>(1)? as usize;
-            let total_time = row.get::<_, i64>(5)? as u64;
-            let savings_pct = if input > 0 {
-                (saved as f64 / input as f64) * 100.0
-            } else {
-                0.0
-            };
-            let avg_time_ms = if commands > 0 {
-                total_time / commands as u64
-            } else {
-                0
-            };
-
-            Ok(DayStats {
-                date: row.get(0)?,
-                commands,
-                input_tokens: input,
-                output_tokens: row.get::<_, i64>(3)? as usize,
-                saved_tokens: saved,
-                savings_pct,
-                total_time_ms: total_time,
-                avg_time_ms,
+        let mut days: Vec<DayStats> = self
+            .accumulate_by(DAY_BUCKET, project_path)?
+            .into_iter()
+            .map(|((date, _), acc)| DayStats {
+                date,
+                commands: acc.commands,
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                saved_tokens: acc.saved_clamped(),
+                savings_pct: acc.savings_pct(),
+                total_time_ms: acc.exec_time_ms,
+                avg_time_ms: acc.avg_time_ms(),
             })
-        })?;
+            .collect();
 
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        result.reverse();
-        Ok(result)
+        // ISO dates sort lexicographically: chronological, oldest first.
+        days.sort_by(|a, b| a.date.cmp(&b.date));
+        Ok(days)
     }
 
     /// Get weekly statistics grouped by week.
@@ -1052,55 +1169,25 @@ impl Tracker {
 
     /// Get weekly statistics filtered by project path. // added
     pub fn get_by_week_filtered(&self, project_path: Option<&str>) -> Result<Vec<WeekStats>> {
-        let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                DATE(timestamp, 'weekday 0', '-6 days') as week_start,
-                DATE(timestamp, 'weekday 0') as week_end,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY week_start
-             ORDER BY week_start DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
-            let input = row.get::<_, i64>(3)? as usize;
-            let saved = row.get::<_, i64>(5)?.max(0) as usize; // clamp net-negative group
-            let commands = row.get::<_, i64>(2)? as usize;
-            let total_time = row.get::<_, i64>(6)? as u64;
-            let savings_pct = if input > 0 {
-                (saved as f64 / input as f64) * 100.0
-            } else {
-                0.0
-            };
-            let avg_time_ms = if commands > 0 {
-                total_time / commands as u64
-            } else {
-                0
-            };
-
-            Ok(WeekStats {
-                week_start: row.get(0)?,
-                week_end: row.get(1)?,
-                commands,
-                input_tokens: input,
-                output_tokens: row.get::<_, i64>(4)? as usize,
-                saved_tokens: saved,
-                savings_pct,
-                total_time_ms: total_time,
-                avg_time_ms,
+        let mut weeks: Vec<WeekStats> = self
+            .accumulate_by(WEEK_BUCKET, project_path)?
+            .into_iter()
+            .map(|((week_start, week_end), acc)| WeekStats {
+                week_start,
+                week_end,
+                commands: acc.commands,
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                saved_tokens: acc.saved_clamped(),
+                savings_pct: acc.savings_pct(),
+                total_time_ms: acc.exec_time_ms,
+                avg_time_ms: acc.avg_time_ms(),
             })
-        })?;
+            .collect();
 
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        result.reverse();
-        Ok(result)
+        // ISO dates sort lexicographically: chronological, oldest first.
+        weeks.sort_by(|a, b| a.week_start.cmp(&b.week_start));
+        Ok(weeks)
     }
 
     /// Get monthly statistics grouped by month.
@@ -1127,53 +1214,24 @@ impl Tracker {
 
     /// Get monthly statistics filtered by project path. // added
     pub fn get_by_month_filtered(&self, project_path: Option<&str>) -> Result<Vec<MonthStats>> {
-        let (project_exact, project_glob) = project_filter_params(project_path); // added
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                strftime('%Y-%m', timestamp) as month,
-                COUNT(*) as commands,
-                SUM(input_tokens) as input,
-                SUM(output_tokens) as output,
-                SUM(saved_tokens) as saved,
-                SUM(exec_time_ms) as total_time
-             FROM commands
-             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
-             GROUP BY month
-             ORDER BY month DESC", // added: project filter
-        )?;
-
-        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
-            // added: params
-            let input = row.get::<_, i64>(2)? as usize;
-            let saved = row.get::<_, i64>(4)?.max(0) as usize; // clamp net-negative group
-            let commands = row.get::<_, i64>(1)? as usize;
-            let total_time = row.get::<_, i64>(5)? as u64;
-            let savings_pct = if input > 0 {
-                (saved as f64 / input as f64) * 100.0
-            } else {
-                0.0
-            };
-            let avg_time_ms = if commands > 0 {
-                total_time / commands as u64
-            } else {
-                0
-            };
-
-            Ok(MonthStats {
-                month: row.get(0)?,
-                commands,
-                input_tokens: input,
-                output_tokens: row.get::<_, i64>(3)? as usize,
-                saved_tokens: saved,
-                savings_pct,
-                total_time_ms: total_time,
-                avg_time_ms,
+        let mut months: Vec<MonthStats> = self
+            .accumulate_by(MONTH_BUCKET, project_path)?
+            .into_iter()
+            .map(|((month, _), acc)| MonthStats {
+                month,
+                commands: acc.commands,
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                saved_tokens: acc.saved_clamped(),
+                savings_pct: acc.savings_pct(),
+                total_time_ms: acc.exec_time_ms,
+                avg_time_ms: acc.avg_time_ms(),
             })
-        })?;
+            .collect();
 
-        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
-        result.reverse();
-        Ok(result)
+        // `YYYY-MM` sorts lexicographically: chronological, oldest first.
+        months.sort_by(|a, b| a.month.cmp(&b.month));
+        Ok(months)
     }
 
     /// Get recent command history.
@@ -1209,8 +1267,10 @@ impl Tracker {
         project_path: Option<&str>,
     ) -> Result<Vec<CommandRecord>> {
         let (project_exact, project_glob) = project_filter_params(project_path); // added
+                                                                                 // Raw token counts, not the stored `saved_tokens`/`savings_pct` columns:
+                                                                                 // both are recomputed against the damped input at read time. // changed: damping
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, rtk_cmd, saved_tokens, savings_pct
+            "SELECT timestamp, rtk_cmd, input_tokens, output_tokens
              FROM commands
              WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
              ORDER BY timestamp DESC
@@ -1220,13 +1280,16 @@ impl Tracker {
         let rows = stmt.query_map(
             params![project_exact, project_glob, limit as i64], // added: project params
             |row| {
+                let input = row.get::<_, i64>(2)? as usize;
+                let output = row.get::<_, i64>(3)? as usize;
                 Ok(CommandRecord {
                     timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     rtk_cmd: row.get(1)?,
-                    saved_tokens: row.get::<_, i64>(2)?.max(0) as usize, // clamp negative
-                    savings_pct: row.get(3)?,
+                    // Clamped for the unsigned field; the pct keeps the honest sign.
+                    saved_tokens: self.damper.effective_saved_clamped(input, output),
+                    savings_pct: self.damper.effective_savings_pct(input, output),
                 })
             },
         )?;
@@ -1924,6 +1987,214 @@ mod tests {
 
         assert_eq!(test_record.saved_tokens, 80);
         assert_eq!(test_record.savings_pct, 80.0);
+    }
+
+    // ── View-only damping ──
+    //
+    // The motivating case: one `rg` that emitted ~26M tokens otherwise dominates
+    // every lifetime figure. These pin that damping changes what the READERS
+    // report while the rows themselves stay raw.
+
+    /// The runaway command still ranks first, but no longer swamps the table.
+    #[test]
+    fn test_damped_summary_shrinks_a_runaway_command() {
+        let tracker = Tracker::new_in_memory_with_damper(Damper::default())
+            .expect("Failed to create tracker");
+
+        // One runaway `rg`, plus an ordinary command that should stay visible.
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 400, 900)
+            .expect("record runaway");
+        tracker
+            .record("git status", "rtk git status", 1_000, 200, 10)
+            .expect("record ordinary");
+
+        let summary = tracker.get_summary().expect("summary");
+
+        // Totals are built from damped inputs: 108_002 + 1_000, not 26_000_000 + 1_000.
+        assert_eq!(summary.total_input, 109_002);
+        assert_eq!(summary.total_output, 600);
+        assert_eq!(summary.total_saved, 108_402);
+        assert_eq!(summary.total_commands, 2);
+
+        // The ordinary command is now ~1% of the total rather than ~0.004%.
+        let ordinary_share = 1_000.0 / summary.total_input as f64;
+        assert!(
+            ordinary_share > 0.009,
+            "an ordinary command must stay legible next to a runaway one, got {ordinary_share}"
+        );
+
+        // Ranking is preserved: the runaway is still the biggest saver.
+        assert_eq!(summary.by_command[0].0, "rtk grep");
+        assert_eq!(summary.by_command[0].2, 107_602);
+        assert_eq!(summary.by_command[1].0, "rtk git status");
+        assert_eq!(summary.by_command[1].2, 800);
+    }
+
+    /// Same rows, damping off: every figure reverts exactly to the raw values.
+    /// This is what makes damping view-only rather than lossy.
+    #[test]
+    fn test_undamped_summary_reports_raw_values() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 400, 900)
+            .expect("record runaway");
+        tracker
+            .record("git status", "rtk git status", 1_000, 200, 10)
+            .expect("record ordinary");
+
+        let summary = tracker.get_summary().expect("summary");
+        assert_eq!(summary.total_input, 26_001_000);
+        assert_eq!(summary.total_saved, 26_000_400);
+        assert!(
+            summary.avg_savings_pct > 99.9,
+            "raw view keeps the inflated rate, got {}",
+            summary.avg_savings_pct
+        );
+    }
+
+    /// The same tracker, re-read at a different ceiling, reports different
+    /// numbers from identical rows — damping never touches storage.
+    #[test]
+    fn test_damping_is_view_only_over_identical_rows() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 400, 900)
+            .expect("record runaway");
+
+        // Raw column is untouched no matter how the aggregates read it.
+        assert_eq!(
+            tracker.total_tokens_saved().expect("raw saved"),
+            25_999_600,
+            "the stored row must stay raw ground truth"
+        );
+
+        let raw = tracker.get_summary().expect("raw summary").total_input;
+        let damped = tracker
+            .with_damper(Damper::default())
+            .get_summary()
+            .expect("damped summary")
+            .total_input;
+
+        assert_eq!(raw, 26_000_000);
+        assert_eq!(damped, 108_002);
+    }
+
+    /// Per-day, per-week and per-month readers damp too — `rtk cc-economics`
+    /// reads those, so a runaway command must not leak back in through them.
+    #[test]
+    fn test_period_readers_damp_consistently() {
+        let tracker = Tracker::new_in_memory_with_damper(Damper::default())
+            .expect("Failed to create tracker");
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 400, 900)
+            .expect("record runaway");
+
+        let days = tracker.get_all_days().expect("days");
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].input_tokens, 108_002);
+        assert_eq!(days[0].saved_tokens, 107_602);
+
+        let weeks = tracker.get_by_week().expect("weeks");
+        assert_eq!(weeks.len(), 1);
+        assert_eq!(weeks[0].input_tokens, 108_002);
+        // A week is keyed by its start and labelled with its end, six days later.
+        assert!(weeks[0].week_end > weeks[0].week_start);
+
+        let months = tracker.get_by_month().expect("months");
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].input_tokens, 108_002);
+
+        // by_day (the sparkline feed) agrees with get_all_days.
+        let summary = tracker.get_summary().expect("summary");
+        assert_eq!(summary.by_day.len(), 1);
+        assert_eq!(summary.by_day[0].1, 107_602);
+    }
+
+    /// `rtk gain --history` damps each row's savings against its damped input.
+    #[test]
+    fn test_recent_history_damps_per_row() {
+        let tracker = Tracker::new_in_memory_with_damper(Damper::default())
+            .expect("Failed to create tracker");
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 400, 900)
+            .expect("record runaway");
+        tracker
+            .record("git status", "rtk git status", 1_000, 200, 10)
+            .expect("record ordinary");
+
+        let recent = tracker.get_recent(10).expect("recent");
+        let runaway = recent
+            .iter()
+            .find(|r| r.rtk_cmd == "rtk grep")
+            .expect("runaway record");
+        assert_eq!(runaway.saved_tokens, 107_602);
+        assert!(
+            (runaway.savings_pct - (107_602.0 / 108_002.0 * 100.0)).abs() < 1e-9,
+            "rate must be measured against the damped input, got {}",
+            runaway.savings_pct
+        );
+
+        // A below-ceiling command is untouched by damping.
+        let ordinary = recent
+            .iter()
+            .find(|r| r.rtk_cmd == "rtk git status")
+            .expect("ordinary record");
+        assert_eq!(ordinary.saved_tokens, 800);
+        assert!((ordinary.savings_pct - 80.0).abs() < 1e-9);
+    }
+
+    /// Damping can turn a huge raw "saving" into a real regression: if a filter
+    /// emitted more than Claude Code would ever have been shown, that is the
+    /// honest reading, and it must stay negative rather than clamp to a fake 0%.
+    #[test]
+    fn test_damping_can_expose_a_regression() {
+        let tracker = Tracker::new_in_memory_with_damper(Damper::default())
+            .expect("Failed to create tracker");
+        // Raw: 26M in, 200k out — looks like a 99% win. Damped: 108_002 in,
+        // 200_000 out — the filter emitted nearly twice the truncation limit.
+        tracker
+            .record("rg pattern", "rtk grep", 26_000_000, 200_000, 900)
+            .expect("record");
+
+        let summary = tracker.get_summary().expect("summary");
+        assert_eq!(
+            summary.total_saved, 0,
+            "unsigned aggregate clamps rather than wrapping to a huge usize"
+        );
+        assert!(
+            summary.avg_savings_pct < 0.0,
+            "the rate keeps the honest negative, got {}",
+            summary.avg_savings_pct
+        );
+
+        let recent = tracker.get_recent(10).expect("recent");
+        assert_eq!(recent[0].saved_tokens, 0);
+        assert!(recent[0].savings_pct < 0.0);
+    }
+
+    /// Ranking in the top-commands table is by tokens saved, and a regressing
+    /// command must sort below a break-even one rather than tie at clamped 0.
+    #[test]
+    fn test_by_command_ranks_regressions_last() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker.record("a", "rtk winner", 1_000, 100, 5).expect("a");
+        tracker
+            .record("b", "rtk breakeven", 100, 100, 5)
+            .expect("b");
+        tracker.record("c", "rtk loser", 100, 900, 5).expect("c");
+
+        let summary = tracker.get_summary().expect("summary");
+        let order: Vec<&str> = summary
+            .by_command
+            .iter()
+            .map(|(cmd, ..)| cmd.as_str())
+            .collect();
+        assert_eq!(order, vec!["rtk winner", "rtk breakeven", "rtk loser"]);
+        // Both non-winners report 0 saved tokens, but only the loser's rate is negative.
+        assert_eq!(summary.by_command[1].2, 0);
+        assert_eq!(summary.by_command[2].2, 0);
+        assert!(summary.by_command[2].3 < 0.0);
     }
 
     // 4. track_passthrough doesn't dilute stats (input=0, output=0)

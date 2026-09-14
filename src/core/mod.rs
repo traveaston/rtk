@@ -4,6 +4,7 @@ pub mod arg_tokenizer;
 pub mod args_utils;
 pub mod config;
 pub mod constants;
+pub mod damping;
 pub mod display_helpers;
 pub mod filter;
 pub mod guard;

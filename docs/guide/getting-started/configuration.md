@@ -26,6 +26,7 @@ rtk config --create   # create config file with defaults
 enabled = true              # enable/disable token tracking
 history_days = 90           # retention in days (auto-cleanup)
 database_path = "/custom/path/history.db"   # optional override
+damping_ceiling = 12500     # damp savings above this many input tokens (0 = off)
 
 [display]
 colors = true               # colored output
@@ -61,6 +62,33 @@ level = "default"           # "default", "high", "full" — see Awareness level
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
+
+## Savings damping
+
+One runaway command — a `rg` that emits ~26M tokens of matches — otherwise dominates
+every lifetime figure `rtk gain` and `rtk cc-economics` report. That input was never a
+real token cost: Claude Code truncates terminal output at ~50KB (~12,500 tokens) before
+the model sees any of it.
+
+`tracking.damping_ceiling` sets the token count above which savings analytics compress
+the raw input logarithmically, so outliers still rank first without swamping everything
+else:
+
+| Raw input tokens | Reported as | Note |
+| --- | --- | --- |
+| 8,000 | 8,000 | Below the ceiling — untouched. |
+| 12,500 | 12,500 | At the ceiling — no cliff. |
+| 1,000,000 | 67,275 | Compressed, still the largest entry. |
+| 26,000,000 | 108,002 | ~8.6x the ceiling instead of ~2080x. |
+
+This is strictly **view-only**. The tracking database keeps raw `input_tokens` forever;
+damping is applied while aggregating, on read. Set `damping_ceiling = 0` and every
+reported number reverts exactly to the raw values.
+
+```toml
+[tracking]
+damping_ceiling = 0         # report raw counts, outliers and all
+```
 
 ## Awareness level
 
